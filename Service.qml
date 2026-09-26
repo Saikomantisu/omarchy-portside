@@ -143,10 +143,16 @@ Item {
     copy(urls.join("\n"))
   }
 
+  // --dir alone is not enough: Ghostty in single-instance mode (Omarchy's
+  // default) opens the window in the running instance, which ignores the
+  // requested folder and inherits the focused terminal's instead. So the
+  // shell changes into the folder itself; the folder travels as an argument,
+  // never through the command string.
   function terminal(row) {
     var dir = row && (row.project || row.cwd)
     if (!dir) return
-    launch(["uwsm-app", "--", "xdg-terminal-exec", "--dir=" + dir])
+    launch(["uwsm-app", "--", "xdg-terminal-exec", "--dir=" + dir, "--",
+            "sh", "-c", "cd \"$1\" && exec \"${SHELL:-/bin/bash}\"", "portside", dir])
   }
 
   function isWatched(row) {
