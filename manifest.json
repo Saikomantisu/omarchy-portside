@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.saikomantisu.portside",
+  "name": "Portside",
+  "version": "0.1.0",
+  "author": "Saikomantisu",
+  "license": "MIT",
+  "description": "Listening ports in the bar, with alerts when a dev server starts, goes down or becomes reachable from the network, and firewall-aware exposure",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "homepage": "https://github.com/Saikomantisu/omarchy-portside",
+  "barWidget": {
+    "displayName": "Portside",
+    "description": "Dev servers and listening ports, with alerts and safe stop",
+    "category": "Developer Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "alerts": true,
+      "alertNewServer": "Dev only",
+      "alertExposed": true,
+      "alertWatchedDown": true,
+      "refreshIntervalSec": 2,
+      "ignoredPorts": "53,631,5353",
+      "hiddenNames": "",
+      "includeContainers": true,
+      "includeUdp": false,
+      "stopParent": true,
+      "showCount": true,
+      "hideWhenEmpty": false
+    },
+    "schema": [
+      { "key": "alerts", "type": "boolean", "label": "Alerts", "description": "Send notifications. The switch in the panel sets this too." },
+      { "key": "alertNewServer", "type": "enum", "label": "Alert when a server starts", "options": ["Off", "Dev only", "All"], "defaultValue": "Dev only" },
+      { "key": "alertExposed", "type": "boolean", "label": "Alert when a port is reachable from the network" },
+      { "key": "alertWatchedDown", "type": "boolean", "label": "Alert when a watched port goes down" },
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Scan interval (seconds)", "min": 1, "max": 30, "step": 1, "defaultValue": 2 },
+      { "key": "ignoredPorts", "type": "string", "label": "Ignored ports", "description": "Ports or ranges to leave out everywhere, e.g. 53,631,8000-8010" },
+      { "key": "hiddenNames", "type": "string", "label": "Hidden names", "description": "Comma-separated process, project or container names to leave out" },
+      { "key": "includeContainers", "type": "boolean", "label": "Include Docker and Podman containers" },
+      { "key": "includeUdp", "type": "boolean", "label": "Include UDP sockets" },
+      { "key": "stopParent", "type": "boolean", "label": "Also stop the dev wrapper (npm, pnpm, tsx…)", "description": "So the server is not restarted straight away. The confirmation names it." },
+      { "key": "showCount", "type": "boolean", "label": "Show the dev server count in the bar" },
+      { "key": "hideWhenEmpty", "type": "boolean", "label": "Hide the bar icon when nothing is running" }
+    ]
+  }
+}

@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""Portside helper: finds listening sockets and acts on them.
+
+  portside scan [--udp] [--no-containers]         one JSON snapshot
+  portside watch [--interval S] [--settle S] ...  NDJSON state lines, one per change
+  portside stop --pid P --start T [--kill] [--parent PPID:PSTART]
+  portside container-stop --runtime docker|podman --id ID
+
+Reads /proc and the saved UFW config only. Needs no privileges and can only
+signal processes owned by the user running it.
+"""
+
+import argparse
+import concurrent.futures
+import ipaddress
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+UID = os.getuid()
+HOME = os.path.realpath(os.path.expanduser("~"))
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+TCP_LISTEN = "0A"
+UDP_UNCONN = "07"
+
+PROJECT_MARKERS = (
+    ".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", "Gemfile",
+    "composer.json", "mix.exs", "deno.json", "deno.jsonc", "pom.xml",
+    "build.gradle", "build.gradle.kts", "manage.py",
+)
+
+# Parents that re-spawn or wrap a dev server. Stopping only the child leaves
+# these to restart it or to sit around holding the terminal.
+SUPERVISORS = {
+    "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsx", "ts-node",
+    "nodemon", "vite", "next", "nuxt", "astro", "turbo", "concurrently",
+    "cargo", "cargo-watch", "watchexec", "air", "go", "uv", "poetry",
+    "pipenv", "flask", "uvicorn", "rails", "foreman", "overmind", "mix",
+}
+
+DEV_RUNTIMES = {
+    "node", "bun", "deno", "python", "python3", "ruby", "php", "java", "go",
+    "dotnet", "beam.smp", "hugo", "jekyll", "caddy", "air",
+}
+
+# (pattern over "comm + cmdline + package deps", label). First match wins.
+FRAMEWORKS = [
+    (r"\bnext(\s|$|/dist)|next-server|next dev", "Next.js"),
+    (r"\bnuxt|nuxi", "Nuxt"),
+    (r"\bastro\b", "Astro"),
+    (r"@sveltejs/kit|svelte-kit", "SvelteKit"),
+    (r"@remix-run|remix (dev|vite)", "Remix"),
+    (r"storybook", "Storybook"),
+    (r"\bvite\b", "Vite"),
+    (r"webpack(-dev-server| serve)", "webpack"),
+    (r"react-scripts", "Create React App"),
+    (r"\bparcel\b", "Parcel"),
+    (r"\bexpo\b", "Expo"),
+    (r"\bwrangler\b", "Wrangler"),
+    (r"manage\.py\s+runserver|\bdaphne\b", "Django"),
+    (r"\buvicorn\b|fastapi", "FastAPI"),
+    (r"\bflask\b", "Flask"),
+    (r"\bgunicorn\b", "Gunicorn"),
+    (r"http\.server", "http.server"),
+    (r"\brails\b|\bpuma\b", "Rails"),
+    (r"artisan\s+serve", "Laravel"),
+    (r"\bphp\s+-S\b", "PHP"),
+    (r"phx\.server|\bphoenix\b", "Phoenix"),
+    (r"\bhugo\b", "Hugo"),
+    (r"\bjekyll\b", "Jekyll"),
+    (r"\bair\b|\bgo-build|go run", "Go"),
+    (r"cargo(-watch)? (run|watch)|/target/(debug|release)/", "Rust"),
+    (r"\bbun\b", "Bun"),
+    (r"\bdeno\b", "Deno"),
+    (r"\bpostgres\b", "PostgreSQL"),
+    (r"redis-server", "Redis"),
+    (r"\bmysqld\b|\bmariadbd\b", "MySQL"),
+    (r"\bmongod\b", "MongoDB"),
+    (r"\bnode\b", "Node"),
+    (r"\bpython3?\b", "Python"),
+]
+
+# Named when /proc will not say who owns a socket. Shown as a guess.
+WELL_KNOWN = {
+    22: "SSH", 25: "SMTP", 53: "DNS", 67: "DHCP", 68: "DHCP", 80: "HTTP",
+    111: "rpcbind", 123: "NTP", 137: "NetBIOS", 138: "NetBIOS", 139: "SMB",
+    443: "HTTPS", 445: "SMB", 546: "DHCPv6", 631: "CUPS", 1900: "SSDP",
+    3306: "MySQL", 3389: "RDP", 5037: "adb", 5353: "mDNS", 5355: "LLMNR",
+    5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 6443: "Kubernetes",
+    8384: "Syncthing", 9090: "Prometheus", 11211: "memcached", 11434: "Ollama",
+    22000: "Syncthing", 27017: "MongoDB", 41641: "Tailscale", 53317: "LocalSend",
+}
+
+VPN_NETS = [ipaddress.ip_network(n) for n in ("100.64.0.0/10", "fd7a:115c:a1e0::/48")]
+
+
+# ---------------------------------------------------------------- /proc/net
+
+def _hex_addr(text):
+    """/proc/net address "0100007F:1F90" -> ("127.0.0.1", 8080)."""
+    addr_hex, port_hex = text.split(":")
+    raw = bytes.fromhex(addr_hex)
+    if len(raw) == 4:
+        ip = socket.inet_ntop(socket.AF_INET, raw[::-1])
+    else:
+        # Four host-order 32-bit words.
+        words = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+        ip = socket.inet_ntop(socket.AF_INET6, words)
+        mapped = ipaddress.IPv6Address(ip).ipv4_mapped
+        if mapped is not None:
+            ip = str(mapped)
+    return ip, int(port_hex, 16)
+
+
+def parse_proc_net(text, proto, want_state):
+    """Listening sockets from one /proc/net/{tcp,tcp6,udp,udp6} file."""
+    out = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 10 or f[3] != want_state:
+            continue
+        ip, port = _hex_addr(f[1])
+        if proto == "udp":
+            rip, rport = _hex_addr(f[2])
+            if rport != 0:
+                continue
+        out.append({"proto": proto, "ip": ip, "port": port, "uid": int(f[7]), "inode": int(f[9])})
+    return out
+
+
+def read_sockets(include_udp):
+    socks = []
+    files = [("tcp", "tcp", TCP_LISTEN), ("tcp6", "tcp", TCP_LISTEN)]
+    if include_udp:
+        files += [("udp", "udp", UDP_UNCONN), ("udp6", "udp", UDP_UNCONN)]
+    for name, proto, state in files:
+        try:
+            with open("/proc/net/" + name) as fh:
+                socks += parse_proc_net(fh.read(), proto, state)
+        except OSError:
+            pass
+    return [s for s in socks if s["port"] != 0]
+
+
+# ---------------------------------------------------------------- processes
+
+def _read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def boot_time():
+    for line in (_read("/proc/stat") or "").splitlines():
+        if line.startswith("btime "):
+            return int(line.split()[1])
+    return 0
+
+
+BOOT = boot_time()
+
+
+def proc_stat(pid):
+    """(comm, ppid, starttime ticks) from /proc/<pid>/stat, or None."""
+    raw = _read("/proc/%d/stat" % pid)
+    if not raw:
+        return None
+    # comm may contain spaces and parens; it runs to the last ')'.
+    lpar, rpar = raw.index("("), raw.rindex(")")
+    comm = raw[lpar + 1:rpar]
+    rest = raw[rpar + 2:].split()
+    return comm, int(rest[1]), int(rest[19])
+
+
+def proc_uid(pid):
+    try:
+        return os.stat("/proc/%d" % pid).st_uid
+    except OSError:
+        return None
+
+
+def cmdline(pid):
+    raw = _read("/proc/%d/cmdline" % pid, binary=True)
+    if not raw:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.rstrip(b"\0").split(b"\0")]
+
+
+def own_pids():
+    for name in os.listdir("/proc"):
+        if name.isdigit() and proc_uid(int(name)) == UID:
+            yield int(name)
+
+
+class InodeMap:
+    """socket inode -> pid, walking /proc/*/fd only for inodes not yet known."""
+
+    def __init__(self):
+        self.map = {}
+
+    def resolve(self, inodes):
+        missing = {i for i in inodes if i not in self.map}
+        if missing:
+            for pid in own_pids():
+                try:
+                    fds = os.listdir("/proc/%d/fd" % pid)
+                except OSError:
+                    continue
+                for fd in fds:
+                    try:
+                        target = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+                    except OSError:
+                        continue
+                    if target.startswith("socket:["):
+                        ino = int(target[8:-1])
+                        if ino in missing:
+                            self.map[ino] = pid
+                            missing.discard(ino)
+                if not missing:
+                    break
+        # Forget sockets that have gone away.
+        live = set(inodes)
+        self.map = {i: p for i, p in self.map.items() if i in live}
+        return self.map
+
+
+# ---------------------------------------------------------------- naming
+
+def find_project(cwd):
+    """Nearest folder at or above cwd holding a project marker, below $HOME."""
+    if not cwd or cwd.endswith(" (deleted)"):
+        return None
+    path = cwd
+    best = None
+    while True:
+        if path == HOME or path == "/":
+            break
+        try:
+            names = set(os.listdir(path))
+        except OSError:
+            names = set()
+        if ".git" in names:
+            return path
+        if best is None and names.intersection(PROJECT_MARKERS):
+            best = path
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return best
+
+
+def package_deps(project):
+    if not project:
+        return ""
+    raw = _read(os.path.join(project, "package.json"))
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ""
+    names = []
+    for key in ("dependencies", "devDependencies"):
+        if isinstance(data.get(key), dict):
+            names += list(data[key])
+    return " ".join(names)
+
+
+def detect_framework(comm, args, deps=""):
+    text = " ".join([comm] + args)
+    for pattern, label in FRAMEWORKS:
+        if re.search(pattern, text):
+            # "node" alone is a poor name when package.json says more.
+            if label in ("Node", "Bun", "Deno") and deps:
+                for dep_pattern, dep_label in FRAMEWORKS[:12]:
+                    if re.search(dep_pattern, deps):
+                        return dep_label
+            return label
+    return None
+
+
+def is_dev_port(port):
+    return 3000 <= port <= 9999 or port in (1313, 1420, 24678, 35729)
+
+
+def is_supervisor(comm, args):
+    names = {comm}
+    for a in args[:3]:
+        names.add(os.path.basename(a))
+    return bool(names & SUPERVISORS)
+
+
+# ---------------------------------------------------------------- exposure
+
+BRIDGE_IFACES = re.compile(r"^(docker\d*|br-[0-9a-f]+|podman\d*|cni\d*|virbr\d*|veth|lxcbr\d*|incusbr\d*)")
+VPN_IFACES = re.compile(r"^(tailscale\d*|wg\d*|tun\d*|tap\d*|zt\w+|nb-\w+|netbird\d*|mullvad\w*|proton\w*)")
+
+
+def interface_addrs():
+    """{address: interface name}, from `ip -j addr`. Empty if ip is missing."""
+    exe = shutil.which("ip")
+    if not exe:
+        return {}
+    try:
+        res = subprocess.run([exe, "-j", "addr"], capture_output=True, text=True, timeout=3)
+        data = json.loads(res.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    out = {}
+    for iface in data:
+        for a in iface.get("addr_info", []):
+            if a.get("local"):
+                out[a["local"]] = iface.get("ifname", "")
+    return out
+
+
+def addr_scope(ip, ifaces=None):
+    """'local', 'bridge', 'vpn' or 'lan' for one bind address."""
+    bare = ip.split("%")[0]
+    addr = ipaddress.ip_address(bare)
+    if addr.is_loopback or addr.is_multicast:
+        return "local"
+    if addr.is_unspecified:
+        return "lan"
+    name = (ifaces or {}).get(bare, "")
+    if name and BRIDGE_IFACES.match(name):
+        return "bridge"
+    if (name and VPN_IFACES.match(name)) or any(addr in net for net in VPN_NETS):
+        return "vpn"
+    return "lan"
+
+
+def parse_ufw(conf, defaults, rules_v4, rules_v6):
+    """Saved UFW state: {'enabled', 'policy', 'rules': [...]}."""
+    enabled = bool(re.search(r"^ENABLED=yes", conf or "", re.M))
+    m = re.search(r'^DEFAULT_INPUT_POLICY="?(\w+)"?', defaults or "", re.M)
+    policy = m.group(1).upper() if m else "ACCEPT"
+    rules = []
+    for text in (rules_v4 or "", rules_v6 or ""):
+        for line in text.splitlines():
+            if not line.startswith("### tuple ###"):
+                continue
+            f = [x for x in line[len("### tuple ###"):].split() if not x.startswith("comment=")]
+            # action proto dport dst sport src [dapp sapp] direction
+            if len(f) < 7:
+                continue
+            action, proto, dport, _dst, _sport, src = f[:6]
+            direction = f[-1]
+            app = len(f) >= 9
+            if direction != "in":
+                continue
+            rules.append({"action": action, "proto": proto, "ports": dport,
+                          "src": src, "app": app})
+    return {"enabled": enabled, "policy": policy, "rules": rules}
+
+
+def load_ufw():
+    return parse_ufw(_read("/etc/ufw/ufw.conf"), _read("/etc/default/ufw"),
+                     _read("/etc/ufw/user.rules"), _read("/etc/ufw/user6.rules"))
+
+
+def _port_in(spec, port):
+    if spec == "any":
+        return True
+    for part in spec.split(","):
+        if ":" in part:
+            lo, hi = part.split(":", 1)
+            if lo.isdigit() and hi.isdigit() and int(lo) <= port <= int(hi):
+                return True
+        elif part.isdigit() and int(part) == port:
+            return True
+    return False
+
+
+def firewall_verdict(ufw, proto, port):
+    """('blocked'|'open'|'unknown', note) for a port bound beyond loopback."""
+    if not ufw["enabled"]:
+        return "unknown", "UFW is not enabled"
+    for rule in ufw["rules"]:
+        if rule["action"] not in ("allow", "limit") or rule["app"]:
+            continue
+        if rule["proto"] not in ("any", proto) or not _port_in(rule["ports"], port):
+            continue
+        if rule["src"] in ("0.0.0.0/0", "::/0"):
+            return "open", "allowed by a UFW rule"
+        return "open", "allowed from " + rule["src"]
+    if ufw["policy"] in ("DROP", "REJECT"):
+        return "blocked", "UFW drops incoming by default and no rule allows it"
+    return "open", "UFW accepts incoming by default"
+
+
+# ---------------------------------------------------------------- containers
+
+def _parse_publish(ports_text):
+    """'0.0.0.0:8080->80/tcp, :::8080->80/tcp' -> [(ip, 8080, 'tcp', 80)]."""
+    out = []
+    for part in (ports_text or "").split(","):
+        m = re.match(r"\s*(.*):(\d+)(?:-\d+)?->(\d+)(?:-\d+)?/(\w+)", part)
+        if m:
+            out.append((m.group(1) or "0.0.0.0", int(m.group(2)), m.group(4), int(m.group(3))))
+    return out
+
+
+def list_containers():
+    found = []
+    for runtime in ("docker", "podman"):
+        exe = shutil.which(runtime)
+        if not exe:
+            continue
+        if runtime == "docker" and not os.access("/var/run/docker.sock", os.R_OK | os.W_OK):
+            continue
+        try:
+            res = subprocess.run([exe, "ps", "--format", "{{json .}}"], capture_output=True,
+                                 text=True, timeout=4)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if res.returncode != 0:
+            continue
+        for line in res.stdout.splitlines():
+            try:
+                c = json.loads(line)
+            except ValueError:
+                continue
+            labels = c.get("Labels") or ""
+            if isinstance(labels, dict):
+                project = labels.get("com.docker.compose.project")
+            else:
+                m = re.search(r"com\.docker\.compose\.project=([^,]+)", labels)
+                project = m.group(1) if m else None
+            ports = c.get("Ports") or ""
+            if isinstance(ports, list):  # podman
+                ports = ", ".join("%s:%s->%s/%s" % (p.get("host_ip") or "0.0.0.0", p.get("host_port"),
+                                                    p.get("container_port"), p.get("protocol", "tcp"))
+                                  for p in ports)
+            names = c.get("Names")
+            name = names[0] if isinstance(names, list) else (names or c.get("ID", "")[:12])
+            found.append({"runtime": runtime, "id": c.get("ID", ""), "name": name,
+                          "image": c.get("Image", ""), "project": project,
+                          "publish": _parse_publish(ports)})
+    return found
+
+
+# ---------------------------------------------------------------- HTTP probe
+
+def probe_http(port, ip):
+    """'http', 'https' or None. One short request; nothing is kept."""
+    host = "::1" if ":" in ip and ip != "::" and not ip.startswith("::ffff") else "127.0.0.1"
+    if addr_scope(ip) != "local" and ip not in ("0.0.0.0", "::"):
+        host = ip
+    req = b"HEAD / HTTP/1.0\r\nHost: localhost\r\nUser-Agent: portside\r\n\r\n"
+    for scheme in ("http", "https"):
+        try:
+            with socket.create_connection((host, port), timeout=0.6) as raw:
+                conn = raw
+                if scheme == "https":
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    conn = ctx.wrap_socket(raw, server_hostname="localhost")
+                conn.settimeout(0.8)
+                conn.sendall(req)
+                if conn.recv(5) == b"HTTP/":
+                    return scheme
+        except (OSError, ssl.SSLError, ValueError):
+            continue
+    return None
+
+
+# ---------------------------------------------------------------- snapshot
+
+class Scanner:
+    def __init__(self, include_udp=False, include_containers=True):
+        self.include_udp = include_udp
+        self.include_containers = include_containers
+        self.inodes = InodeMap()
+        self.http = {}          # (pid, start, port) -> scheme | None
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.pending = {}
+        self.containers = []
+        self.containers_at = 0
+        self.ufw = load_ufw()
+        self.ifaces = interface_addrs()
+        self.ufw_at = time.time()
+
+    def refresh_slow(self, now):
+        if now - self.ufw_at > 30:
+            self.ufw, self.ifaces, self.ufw_at = load_ufw(), interface_addrs(), now
+        if self.include_containers and now - self.containers_at > 10:
+            self.containers, self.containers_at = list_containers(), now
+
+    def scan(self):
+        now = time.time()
+        self.refresh_slow(now)
+        socks = read_sockets(self.include_udp)
+        owners = self.inodes.resolve([s["inode"] for s in socks if s["uid"] == UID])
+
+        published = {}
+        for c in self.containers:
+            for host_ip, host_port, proto, cport in c["publish"]:
+                published[(proto, host_port)] = (c, cport)
+
+        groups = {}
+        for s in socks:
+            pid = owners.get(s["inode"]) if s["uid"] == UID else None
+            ctr = published.get((s["proto"], s["port"]))
+            if ctr:
+                key = "ctr:%s:%s" % (ctr[0]["id"][:12], s["port"])
+            elif pid:
+                key = "pid:%d" % pid
+            else:
+                key = "sys:%s:%d:%d" % (s["proto"], s["port"], s["uid"])
+            g = groups.setdefault(key, {"key": key, "pid": pid, "ctr": ctr, "uid": s["uid"], "socks": []})
+            g["socks"].append(s)
+
+        # Containers whose published port has no visible host socket (rootless,
+        # or a proxy we cannot see) still belong in the list.
+        for (proto, port), ctr in published.items():
+            key = "ctr:%s:%s" % (ctr[0]["id"][:12], port)
+            if key not in groups and (proto == "tcp" or self.include_udp):
+                groups[key] = {"key": key, "pid": None, "ctr": ctr, "uid": -1,
+                               "socks": [{"proto": proto, "ip": "0.0.0.0", "port": port}]}
+
+        rows = [self.build_row(g) for g in groups.values()]
+        rows = [r for r in rows if r]
+        self.collect_probes(rows)
+        rows.sort(key=lambda r: (r["group"] != "dev", r["group"], min(r["ports"])))
+        return {"rows": rows, "ufw": {"enabled": self.ufw["enabled"], "policy": self.ufw["policy"]},
+                "uid": UID, "at": int(now)}
+
+    def build_row(self, g):
+        socks = g["socks"]
+        ports = sorted({s["port"] for s in socks})
+        protos = sorted({s["proto"] for s in socks})
+        addrs = sorted({s["ip"] for s in socks})
+        row = {"key": g["key"], "ports": ports, "proto": "/".join(protos), "addrs": addrs,
+               "uid": g["uid"], "mine": g["uid"] == UID, "pid": None, "start": None,
+               "startedAt": None, "comm": None, "cmd": [], "cwd": None, "project": None,
+               "projectName": None, "framework": None, "guess": None, "container": None,
+               "parent": None, "http": {}, "group": "system"}
+
+        scopes = {addr_scope(a, self.ifaces) for a in addrs}
+        # The widest reach of any bind address wins.
+        scope = next((s for s in ("lan", "vpn", "bridge") if s in scopes), "local")
+
+        if g["ctr"]:
+            c, cport = g["ctr"]
+            row.update(container={"runtime": c["runtime"], "id": c["id"], "name": c["name"],
+                                  "image": c["image"], "port": cport},
+                       projectName=c["project"] or c["name"], framework=c["image"].split(":")[0].split("/")[-1],
+                       group="containers", mine=True)
+            row["reach"] = "published" if scope == "lan" else scope
+            row["reachNote"] = ("Docker publishes ports past UFW" if row["reach"] == "published"
+                                else "published on %s only" % ", ".join(addrs))
+            return row
+
+        pid = g["pid"]
+        if pid:
+            st = proc_stat(pid)
+            if not st:
+                return None
+            comm, ppid, start = st
+            args = cmdline(pid)
+            # Runtimes rename their main thread (node -> "node-MainThread"), so
+            # argv[0] names the program more reliably than comm.
+            if args and os.path.basename(args[0]):
+                comm = os.path.basename(args[0])
+            try:
+                cwd = os.readlink("/proc/%d/cwd" % pid)
+            except OSError:
+                cwd = None
+            project = find_project(cwd)
+            deps = package_deps(project)
+            framework = detect_framework(comm, args, deps)
+            row.update(pid=pid, start=start, startedAt=BOOT + start // CLK_TCK, comm=comm,
+                       cmd=args, cwd=cwd, project=project,
+                       projectName=os.path.basename(project) if project else (os.path.basename(cwd) if cwd else comm),
+                       framework=framework)
+            pst = proc_stat(ppid) if ppid > 1 else None
+            if pst and proc_uid(ppid) == UID:
+                pargs = cmdline(ppid)
+                pname = os.path.basename(pargs[0]) if pargs else pst[0]
+                row["parent"] = {"pid": ppid, "start": pst[2], "comm": pname,
+                                 "cmd": pargs, "supervisor": is_supervisor(pst[0], pargs)}
+            dev = bool(framework) or comm in DEV_RUNTIMES or any(is_dev_port(p) for p in ports)
+            row["group"] = "dev" if dev else "apps"
+        else:
+            row["guess"] = WELL_KNOWN.get(ports[0])
+
+        if scope == "lan":
+            verdicts = [firewall_verdict(self.ufw, row["proto"].split("/")[0], p) for p in ports]
+            order = {"open": 0, "unknown": 1, "blocked": 2}
+            verdict, note = sorted(verdicts, key=lambda v: order[v[0]])[0]
+            row["reach"], row["reachNote"] = verdict, note
+        else:
+            row["reach"] = scope
+            row["reachNote"] = {"local": "loopback only", "vpn": "VPN address only",
+                                "bridge": "container bridge only"}[scope]
+        return row
+
+    def collect_probes(self, rows):
+        live = set()
+        for r in rows:
+            if not r["mine"] or r["container"] or r["proto"] == "udp":
+                continue
+            for p in r["ports"]:
+                k = (r["pid"], r["start"], p)
+                live.add(k)
+                if k not in self.http and k not in self.pending:
+                    self.pending[k] = self.pool.submit(probe_http, p, r["addrs"][0])
+        for k, fut in list(self.pending.items()):
+            if fut.done():
+                try:
+                    self.http[k] = fut.result()
+                except Exception:
+                    self.http[k] = None
+                del self.pending[k]
+        self.http = {k: v for k, v in self.http.items() if k in live}
+        for r in rows:
+            for p in r["ports"]:
+                v = self.http.get((r["pid"], r["start"], p))
+                if v:
+                    r["http"][str(p)] = v
+            if r["container"]:
+                r["http"] = {str(p): "http" for p in r["ports"]}  # not probed; offer open anyway
+
+
+# ---------------------------------------------------------------- events
+
+class Events:
+    """Turns successive snapshots into settled alert events.
+
+    A listener must stay up for `settle` seconds before it is announced, and a
+    port that vanishes and returns within that window (HMR restart, a watcher
+    re-spawning) is neither "new" nor "down".
+    """
+
+    def __init__(self, settle):
+        self.settle = settle
+        self.first = {}        # port-key -> first seen
+        self.announced = {}    # port-key -> reach at announcement
+        self.gone = {}         # port-key -> (vanished at, last row)
+        self.primed = False
+
+    @staticmethod
+    def port_key(row):
+        return "%s:%s" % (row.get("projectName") or row.get("guess") or "?", min(row["ports"]))
+
+    def step(self, rows, now):
+        events = []
+        seen = {}
+        for r in rows:
+            if r["mine"]:
+                seen[self.port_key(r)] = r
+        for k, r in seen.items():
+            back = self.gone.pop(k, None)
+            if back:
+                # Came back inside the settle window: a restart, not a new server.
+                self.announced[k] = back[1]
+                self.first[k] = now - self.settle
+            self.first.setdefault(k, now)
+            if not self.primed:
+                self.announced[k] = r["reach"]
+                continue
+            if now - self.first[k] < self.settle:
+                continue
+            if k not in self.announced:
+                self.announced[k] = r["reach"]
+                events.append({"kind": "new", "key": r["key"], "portKey": k})
+                if r["reach"] in ("open", "published"):
+                    events.append({"kind": "exposed", "key": r["key"], "portKey": k})
+            elif r["reach"] in ("open", "published") and self.announced[k] not in ("open", "published"):
+                self.announced[k] = r["reach"]
+                events.append({"kind": "exposed", "key": r["key"], "portKey": k})
+        for k in list(self.first):
+            if k not in seen:
+                del self.first[k]
+                if k in self.announced:
+                    self.gone[k] = (now, self.announced.pop(k))
+        for k, (at, _) in list(self.gone.items()):
+            if now - at >= self.settle:
+                del self.gone[k]
+                events.append({"kind": "down", "portKey": k})
+        self.primed = True
+        return events
+
+
+# ---------------------------------------------------------------- actions
+
+def _supports_pidfd():
+    return hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+
+
+def _identity_ok(pid, start):
+    if pid <= 1 or pid in (os.getpid(), os.getppid()):
+        return False, "refusing to signal pid %d" % pid
+    if proc_uid(pid) != UID:
+        return False, "pid %d is not yours" % pid
+    st = proc_stat(pid)
+    if not st:
+        return False, "pid %d has already exited" % pid
+    if st[2] != start:
+        return False, "pid %d is now a different process" % pid
+    if st[0] in ("quickshell", "qs", "Hyprland", "systemd"):
+        return False, "refusing to signal %s" % st[0]
+    return True, st[0]
+
+
+def signal_process(pid, start, sig):
+    ok, why = _identity_ok(pid, start)
+    if not ok:
+        return {"pid": pid, "ok": False, "error": why}
+    if _supports_pidfd():
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return {"pid": pid, "ok": False, "error": "pid %d has already exited" % pid}
+        try:
+            # Re-check now that the pidfd pins the process.
+            ok, why = _identity_ok(pid, start)
+            if not ok:
+                return {"pid": pid, "ok": False, "error": why}
+            signal.pidfd_send_signal(fd, sig)
+            return {"pid": pid, "ok": True, "fd": fd}
+        except ProcessLookupError:
+            os.close(fd)
+            return {"pid": pid, "ok": False, "error": "pid %d has already exited" % pid}
+    os.kill(pid, sig)
+    return {"pid": pid, "ok": True, "fd": None}
+
+
+def wait_exit(results, timeout):
+    """Wait for signalled processes to exit; returns pids still running."""
+    deadline = time.time() + timeout
+    alive = {r["pid"]: r for r in results if r.get("ok")}
+    while alive and time.time() < deadline:
+        for pid, r in list(alive.items()):
+            fd = r.get("fd")
+            if fd is not None:
+                ready, _, _ = select.select([fd], [], [], 0)
+                if ready:
+                    del alive[pid]
+            else:
+                st = proc_stat(pid)
+                if not st or st[2] != r.get("start"):
+                    del alive[pid]
+        if alive:
+            time.sleep(0.1)
+    for r in results:
+        if r.get("fd") is not None:
+            os.close(r.pop("fd"))
+        r.pop("fd", None)
+    return sorted(alive)
+
+
+def cmd_stop(a):
+    sig = signal.SIGKILL if a.kill else signal.SIGTERM
+    results = []
+    targets = [(a.pid, a.start)]
+    if a.parent:
+        ppid, pstart = (int(x) for x in a.parent.split(":"))
+        st = proc_stat(ppid)
+        if st and is_supervisor(st[0], cmdline(ppid)):
+            targets.append((ppid, pstart))
+        else:
+            results.append({"pid": ppid, "ok": False, "error": "parent is not a dev supervisor; left running"})
+    for pid, start in targets:
+        r = signal_process(pid, start, sig)
+        r["start"] = start
+        results.append(r)
+    still = wait_exit(results, 3.0 if not a.kill else 1.0)
+    for r in results:
+        r.pop("start", None)
+    out = {"ok": any(r.get("ok") for r in results) and not still, "signal": "KILL" if a.kill else "TERM",
+           "results": results, "stillRunning": still}
+    print(json.dumps(out))
+    return 0 if out["ok"] else 1
+
+
+def cmd_container_stop(a):
+    if a.runtime not in ("docker", "podman") or not re.fullmatch(r"[0-9a-f]{6,64}", a.id):
+        print(json.dumps({"ok": False, "error": "bad container reference"}))
+        return 2
+    exe = shutil.which(a.runtime)
+    if not exe:
+        print(json.dumps({"ok": False, "error": a.runtime + " is not installed"}))
+        return 1
+    res = subprocess.run([exe, "stop", a.id], capture_output=True, text=True, timeout=30)
+    print(json.dumps({"ok": res.returncode == 0, "error": res.stderr.strip()[-300:]}))
+    return res.returncode
+
+
+# ---------------------------------------------------------------- main
+
+def cmd_scan(a):
+    sc = Scanner(a.udp, not a.no_containers)
+    snap = sc.scan()
+    # Give HTTP probes a moment so a one-shot scan is useful.
+    deadline = time.time() + 1.5
+    while sc.pending and time.time() < deadline:
+        time.sleep(0.05)
+        sc.collect_probes(snap["rows"])
+    print(json.dumps(snap, indent=1 if a.pretty else None))
+    return 0
+
+
+def _signature(rows):
+    return json.dumps([[r["key"], r["ports"], r["addrs"], r["reach"], r["http"], r["framework"]] for r in rows])
+
+
+def cmd_watch(a):
+    sc = Scanner(a.udp, not a.no_containers)
+    ev = Events(a.settle)
+    last = None
+    parent = os.getppid()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    while True:
+        now = time.time()
+        snap = sc.scan()
+        events = ev.step(snap["rows"], now)
+        sig = _signature(snap["rows"])
+        if sig != last or events:
+            snap["type"] = "state"
+            snap["events"] = events
+            try:
+                sys.stdout.write(json.dumps(snap) + "\n")
+                sys.stdout.flush()
+            except BrokenPipeError:
+                return 0
+            last = sig
+        # Poll faster while an HTTP probe or a settle window is pending.
+        busy = sc.pending or ev.gone or any(now - t < a.settle for t in ev.first.values())
+        time.sleep(min(a.interval, 1.0) if busy else a.interval)
+        if os.getppid() != parent:  # the shell went away; we were re-parented
+            return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="portside")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("scan", "watch"):
+        s = sub.add_parser(name)
+        s.add_argument("--udp", action="store_true")
+        s.add_argument("--no-containers", action="store_true")
+        if name == "scan":
+            s.add_argument("--pretty", action="store_true")
+        else:
+            s.add_argument("--interval", type=float, default=2.0)
+            s.add_argument("--settle", type=float, default=3.0)
+    s = sub.add_parser("stop")
+    s.add_argument("--pid", type=int, required=True)
+    s.add_argument("--start", type=int, required=True)
+    s.add_argument("--kill", action="store_true")
+    s.add_argument("--parent", help="PPID:START of a dev supervisor to stop as well")
+    s = sub.add_parser("container-stop")
+    s.add_argument("--runtime", required=True)
+    s.add_argument("--id", required=True)
+    a = p.parse_args(argv)
+    if a.cmd == "watch":
+        a.interval = max(0.5, min(a.interval, 60.0))
+    return {"scan": cmd_scan, "watch": cmd_watch, "stop": cmd_stop,
+            "container-stop": cmd_container_stop}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+*filter
+### RULES ###
+
+### tuple ### allow udp 53317 0.0.0.0/0 any 0.0.0.0/0 in
+-A ufw-user-input -p udp --dport 53317 -j ACCEPT
+### tuple ### allow tcp 53317 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 8000:8010 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow tcp 80,443 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### deny tcp 23 0.0.0.0/0 any 0.0.0.0/0 in
+### tuple ### allow udp 53 172.17.0.1 any 172.16.0.0/12 in comment=616c6c6f772d646f636b65722d646e73
+### tuple ### allow any any 0.0.0.0/0 any 0.0.0.0/0 OpenSSH - in
+### tuple ### allow tcp 9999 0.0.0.0/0 any 0.0.0.0/0 out
+
+### END RULES ###
+COMMIT
