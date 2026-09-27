@@ -5,6 +5,8 @@ your machine. It sends a notification when a dev server starts, goes down, or
 becomes reachable from the network. Before it calls a port exposed, it checks
 UFW. It also flags Docker ports, because Docker's own rules skip UFW.
 
+![Portside panel](preview.png)
+
 ## Install
 
 ```bash
