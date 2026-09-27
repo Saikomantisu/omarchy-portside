@@ -84,7 +84,9 @@ class Ufw(unittest.TestCase):
 
     def test_disabled_and_accepting(self):
         off = ps.parse_ufw("ENABLED=no\n", "", "", "")
-        self.assertEqual(ps.firewall_verdict(off, "tcp", 3000)[0], "unknown")
+        self.assertEqual(ps.firewall_verdict(off, "tcp", 3000)[0], "open")
+        missing = ps.parse_ufw("", "", "", "")
+        self.assertEqual(ps.firewall_verdict(missing, "tcp", 3000)[0], "open")
         accepting = ps.parse_ufw("ENABLED=yes\n", 'DEFAULT_INPUT_POLICY="ACCEPT"\n', "", "")
         self.assertEqual(ps.firewall_verdict(accepting, "tcp", 3000)[0], "open")
 
@@ -171,6 +173,14 @@ class EventsTest(unittest.TestCase):
         ev.step([row("b", 4000, "blocked")], 5)
         ev.step([row("b", 4000, "blocked")], 9)
         self.assertEqual([e["kind"] for e in ev.step([row("b", 4000, "published")], 10)], ["exposed"])
+
+    def test_lan_listener_alerts_with_ufw_off(self):
+        off = ps.parse_ufw("ENABLED=no\n", "", "", "")
+        reach = ps.firewall_verdict(off, "tcp", 3000)[0]
+        ev = ps.Events(3)
+        ev.step([], 0)
+        ev.step([row("a", 3000, reach)], 1)
+        self.assertIn("exposed", [e["kind"] for e in ev.step([row("a", 3000, reach)], 5)])
 
     def test_other_users_ignored(self):
         ev = ps.Events(3)

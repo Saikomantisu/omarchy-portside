@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.saikomantisu.portside",
   "name": "Portside",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Saikomantisu",
   "license": "MIT",
   "description": "Listening ports in the bar, with alerts when a dev server starts, goes down or becomes reachable from the network, and firewall-aware exposure",

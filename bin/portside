@@ -385,9 +385,13 @@ def _port_in(spec, port):
 
 
 def firewall_verdict(ufw, proto, port):
-    """('blocked'|'open'|'unknown', note) for a port bound beyond loopback."""
+    """('blocked'|'open', note) for a port bound beyond loopback.
+
+    Portside only reads UFW, so with UFW off nothing it can see filters the
+    port: call it open rather than stay quiet about it.
+    """
     if not ufw["enabled"]:
-        return "unknown", "UFW is not enabled"
+        return "open", "UFW is off, so nothing filters it"
     for rule in ufw["rules"]:
         if rule["action"] not in ("allow", "limit") or rule["app"]:
             continue
@@ -600,7 +604,7 @@ class Scanner:
 
         if scope == "lan":
             verdicts = [firewall_verdict(self.ufw, row["proto"].split("/")[0], p) for p in ports]
-            order = {"open": 0, "unknown": 1, "blocked": 2}
+            order = {"open": 0, "blocked": 1}
             verdict, note = sorted(verdicts, key=lambda v: order[v[0]])[0]
             row["reach"], row["reachNote"] = verdict, note
         else:

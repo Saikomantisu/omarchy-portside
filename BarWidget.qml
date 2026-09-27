@@ -413,7 +413,6 @@ Panel {
     // buttons, where a MouseArea would report the pointer as gone.
     readonly property bool showActions: rowHover.hovered
     readonly property color toneColor: reach.tone === "urgent" ? root.urgent
-      : reach.tone === "warn" ? Color.accent
       : reach.tone === "normal" ? root.foreground : root.dim
 
     hasCursor: rowHover.hovered
