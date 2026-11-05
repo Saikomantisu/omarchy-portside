@@ -181,8 +181,9 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.showCount && !vertical ? "󰒍 " + root.sum.dev : "󰒍"
-    slotSize: Style.bar.iconSlot * (root.showCount && !vertical ? 1.8 : 1)
+    text: "󰒍"
+    labelText: root.showCount && !vertical ? String(root.sum.dev) : ""
+    slotSize: Style.bar.iconSlot * (root.showCount && !vertical ? 1.5 : 1)
     active: root.sum.exposed > 0
     tooltipText: root.service ? Model.tooltip(root.sum) : "Portside is starting"
     onPressed: function(b) {
